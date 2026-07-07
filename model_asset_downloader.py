@@ -1,5 +1,6 @@
 import concurrent.futures
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -82,6 +83,26 @@ def _sha256_file(path: str) -> str:
         for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _hash_cache_path(dest_path: str) -> str:
+    return dest_path + ".dlcache.json"
+
+
+def _load_hash_cache(dest_path: str):
+    try:
+        with open(_hash_cache_path(dest_path), "r") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _save_hash_cache(dest_path: str, size: int, mtime: float, sha256: str):
+    try:
+        with open(_hash_cache_path(dest_path), "w") as f:
+            json.dump({"size": size, "mtime": mtime, "sha256": sha256}, f)
+    except OSError:
+        pass
 
 
 class _CivitaiSource:
@@ -465,11 +486,32 @@ class ModelAssetDownloader:
     def _matches_existing(dest_path: str, info: dict) -> bool:
         expected_sha256 = info.get("sha256")
         expected_size = info.get("size_bytes")
+
         if expected_sha256:
-            return _sha256_file(dest_path) == expected_sha256
+            stat = os.stat(dest_path)
+            cached = _load_hash_cache(dest_path)
+            if (
+                cached
+                and cached.get("size") == stat.st_size
+                and cached.get("mtime") == stat.st_mtime
+                and cached.get("sha256") == expected_sha256
+            ):
+                # File hasn't been touched since we last verified it against
+                # this exact remote hash, so skip re-reading the whole thing.
+                return True
+
+            actual_sha256 = _sha256_file(dest_path)
+            if actual_sha256 == expected_sha256:
+                _save_hash_cache(dest_path, stat.st_size, stat.st_mtime, actual_sha256)
+                return True
+            return False
+
         if expected_size:
             return os.path.getsize(dest_path) == expected_size
-        return True
+
+        # Neither a hash nor a size was available to compare against: don't
+        # assume a same-named local file is the right one, re-download it.
+        return False
 
 
 NODE_CLASS_MAPPINGS = {"ModelAssetDownloader": ModelAssetDownloader}
