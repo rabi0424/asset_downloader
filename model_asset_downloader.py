@@ -1,7 +1,10 @@
+import concurrent.futures
 import hashlib
+import json
 import os
 import re
 import tempfile
+import threading
 import time
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
@@ -25,6 +28,7 @@ SAVE_TYPES = [
     "checkpoints",
     "loras",
     "vae",
+    "text_encoders",
     "controlnet",
     "embeddings",
     "upscale_models",
@@ -33,7 +37,17 @@ SAVE_TYPES = [
     "clip_vision",
 ]
 
+# folder_paths key(s) to try, in order, for a given save_type. Older ComfyUI
+# installs only register "clip" for text-encoder models; newer ones also
+# register "text_encoders" pointing at the same directory.
+SAVE_TYPE_FOLDER_ALIASES = {
+    "text_encoders": ["text_encoders", "clip"],
+}
+
 CHUNK_SIZE = 1024 * 1024  # 1 MiB
+DEFAULT_MAX_CONNECTIONS = 4
+MAX_ALLOWED_CONNECTIONS = 8
+MIN_SIZE_FOR_PARALLEL = 32 * 1024 * 1024  # below this, one connection is enough
 
 
 class AssetDownloadError(Exception):
@@ -50,15 +64,17 @@ def _sanitize_filename(name: str) -> str:
 
 
 def _get_save_dir(save_type: str) -> str:
-    try:
-        paths = folder_paths.get_folder_paths(save_type)
-    except KeyError:
-        raise AssetDownloadError(f"Unknown save_type: {save_type}")
-    if not paths:
-        raise AssetDownloadError(f"No configured directory for save_type: {save_type}")
-    save_dir = paths[0]
-    os.makedirs(save_dir, exist_ok=True)
-    return save_dir
+    candidates = SAVE_TYPE_FOLDER_ALIASES.get(save_type, [save_type])
+    for name in candidates:
+        try:
+            paths = folder_paths.get_folder_paths(name)
+        except KeyError:
+            continue
+        if paths:
+            save_dir = paths[0]
+            os.makedirs(save_dir, exist_ok=True)
+            return save_dir
+    raise AssetDownloadError(f"No configured directory for save_type: {save_type}")
 
 
 def _sha256_file(path: str) -> str:
@@ -67,6 +83,26 @@ def _sha256_file(path: str) -> str:
         for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _hash_cache_path(dest_path: str) -> str:
+    return dest_path + ".dlcache.json"
+
+
+def _load_hash_cache(dest_path: str):
+    try:
+        with open(_hash_cache_path(dest_path), "r") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _save_hash_cache(dest_path: str, size: int, mtime: float, sha256: str):
+    try:
+        with open(_hash_cache_path(dest_path), "w") as f:
+            json.dump({"size": size, "mtime": mtime, "sha256": sha256}, f)
+    except OSError:
+        pass
 
 
 class _CivitaiSource:
@@ -225,7 +261,17 @@ class _HuggingFaceSource:
         return int(size) if size else None
 
 
-def _stream_download(url: str, headers: dict, dest_path: str, expected_size=None):
+def _supports_range(url: str, headers: dict) -> bool:
+    try:
+        resp = requests.head(url, headers=headers, allow_redirects=True, timeout=30)
+    except requests.RequestException:
+        return False
+    if resp.status_code >= 400:
+        return False
+    return resp.headers.get("accept-ranges", "").strip().lower() == "bytes"
+
+
+def _sequential_download(url: str, headers: dict, dest_path: str, total: Optional[int]):
     try:
         resp_ctx = requests.get(url, headers=headers, stream=True, timeout=60)
     except requests.RequestException as e:
@@ -239,7 +285,7 @@ def _stream_download(url: str, headers: dict, dest_path: str, expected_size=None
         except requests.HTTPError as e:
             raise AssetDownloadError(f"Download request to {url} failed: {e}")
 
-        total = expected_size or (int(resp.headers["content-length"]) if "content-length" in resp.headers else None)
+        total = total or (int(resp.headers["content-length"]) if "content-length" in resp.headers else None)
         progress = ProgressBar(100) if ProgressBar and total else None
         downloaded = 0
         last_log = time.time()
@@ -269,6 +315,112 @@ def _stream_download(url: str, headers: dict, dest_path: str, expected_size=None
             raise
 
 
+def _parallel_download(url: str, headers: dict, dest_path: str, total: int, num_workers: int):
+    num_workers = max(1, min(num_workers, MAX_ALLOWED_CONNECTIONS))
+    part_size = total // num_workers
+    ranges = []
+    start = 0
+    for i in range(num_workers):
+        end = total - 1 if i == num_workers - 1 else start + part_size - 1
+        ranges.append((start, end))
+        start = end + 1
+
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(dest_path), prefix=".download_")
+    os.close(fd)
+    with open(tmp_path, "wb") as f:
+        f.truncate(total)
+
+    write_lock = threading.Lock()
+    progress_state = {"downloaded": 0}
+    out_file = open(tmp_path, "r+b")
+
+    def fetch_range(range_start: int, range_end: int):
+        pos = range_start
+        attempts = 0
+        while pos <= range_end:
+            attempts += 1
+            try:
+                range_headers = dict(headers)
+                range_headers["Range"] = f"bytes={pos}-{range_end}"
+                with requests.get(url, headers=range_headers, stream=True, timeout=60) as resp:
+                    if resp.status_code != 206:
+                        raise AssetDownloadError(f"range request not honored (status {resp.status_code})")
+                    for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                        if not chunk:
+                            continue
+                        with write_lock:
+                            out_file.seek(pos)
+                            out_file.write(chunk)
+                            progress_state["downloaded"] += len(chunk)
+                        pos += len(chunk)
+            except (requests.RequestException, AssetDownloadError) as e:
+                if attempts >= 3:
+                    raise AssetDownloadError(f"Failed to download byte range {range_start}-{range_end}: {e}")
+                time.sleep(1.5 * attempts)
+
+    progress = ProgressBar(100) if ProgressBar else None
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(fetch_range, s, e) for s, e in ranges]
+            last_log = time.time()
+            while True:
+                _, not_done = concurrent.futures.wait(futures, timeout=2)
+                pct = progress_state["downloaded"] / total * 100
+                if progress:
+                    try:
+                        progress.update_absolute(int(pct))
+                    except Exception:
+                        pass
+                now = time.time()
+                if now - last_log > 2:
+                    print(
+                        f"[AssetDownloader] downloading ({num_workers} connections) "
+                        f"{os.path.basename(dest_path)}: {pct:.1f}%"
+                    )
+                    last_log = now
+                if not not_done:
+                    break
+            for fut in futures:
+                fut.result()
+    except BaseException:
+        out_file.close()
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+    out_file.close()
+    os.replace(tmp_path, dest_path)
+
+
+def _download_asset(
+    url: str,
+    headers: dict,
+    dest_path: str,
+    expected_size: Optional[int] = None,
+    max_connections: int = DEFAULT_MAX_CONNECTIONS,
+):
+    total = expected_size
+    if total is None:
+        try:
+            head = requests.head(url, headers=headers, allow_redirects=True, timeout=30)
+            if "content-length" in head.headers:
+                total = int(head.headers["content-length"])
+        except requests.RequestException:
+            total = None
+
+    eligible_for_parallel = (
+        max_connections > 1 and total is not None and total >= MIN_SIZE_FOR_PARALLEL
+    )
+    if eligible_for_parallel and _supports_range(url, headers):
+        try:
+            _parallel_download(url, headers, dest_path, total, max_connections)
+            return
+        except Exception as e:
+            print(f"[AssetDownloader] parallel download failed ({e}), falling back to a single connection.")
+
+    _sequential_download(url, headers, dest_path, total)
+
+
 class ModelAssetDownloader:
     CATEGORY = "loaders/downloaders"
     RETURN_TYPES = ("STRING",)
@@ -286,17 +438,18 @@ class ModelAssetDownloader:
             "optional": {
                 "filename": ("STRING", {"default": ""}),
                 "overwrite": ("BOOLEAN", {"default": False}),
+                "max_connections": ("INT", {"default": DEFAULT_MAX_CONNECTIONS, "min": 1, "max": MAX_ALLOWED_CONNECTIONS}),
             },
         }
 
     @classmethod
-    def IS_CHANGED(cls, url, save_type, filename="", overwrite=False):
+    def IS_CHANGED(cls, url, save_type, filename="", overwrite=False, max_connections=DEFAULT_MAX_CONNECTIONS):
         # Always re-check: the node itself decides cheaply whether a real
         # download is needed by comparing the local file against remote
         # metadata (hash/size) before doing any heavy network transfer.
         return float("nan")
 
-    def download(self, url, save_type, filename="", overwrite=False):
+    def download(self, url, save_type, filename="", overwrite=False, max_connections=DEFAULT_MAX_CONNECTIONS):
         url = (url or "").strip()
         if not url:
             raise AssetDownloadError("url is empty.")
@@ -326,18 +479,39 @@ class ModelAssetDownloader:
             print(f"[AssetDownloader] '{final_name}' exists but does not match the remote file, re-downloading.")
 
         print(f"[AssetDownloader] downloading {info['download_url']} -> {dest_path}")
-        _stream_download(info["download_url"], headers, dest_path, info.get("size_bytes"))
+        _download_asset(info["download_url"], headers, dest_path, info.get("size_bytes"), max_connections)
         return (dest_path,)
 
     @staticmethod
     def _matches_existing(dest_path: str, info: dict) -> bool:
         expected_sha256 = info.get("sha256")
         expected_size = info.get("size_bytes")
+
         if expected_sha256:
-            return _sha256_file(dest_path) == expected_sha256
+            stat = os.stat(dest_path)
+            cached = _load_hash_cache(dest_path)
+            if (
+                cached
+                and cached.get("size") == stat.st_size
+                and cached.get("mtime") == stat.st_mtime
+                and cached.get("sha256") == expected_sha256
+            ):
+                # File hasn't been touched since we last verified it against
+                # this exact remote hash, so skip re-reading the whole thing.
+                return True
+
+            actual_sha256 = _sha256_file(dest_path)
+            if actual_sha256 == expected_sha256:
+                _save_hash_cache(dest_path, stat.st_size, stat.st_mtime, actual_sha256)
+                return True
+            return False
+
         if expected_size:
             return os.path.getsize(dest_path) == expected_size
-        return True
+
+        # Neither a hash nor a size was available to compare against: don't
+        # assume a same-named local file is the right one, re-download it.
+        return False
 
 
 NODE_CLASS_MAPPINGS = {"ModelAssetDownloader": ModelAssetDownloader}
