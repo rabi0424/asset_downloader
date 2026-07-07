@@ -1,0 +1,9 @@
+[project]
+name = "asset_downloader"
+description = "ComfyUI custom node to download checkpoints/LoRAs from HuggingFace or Civitai URLs into the matching ComfyUI models folder."
+version = "1.0.0"
+dependencies = ["requests"]
+
+[tool.comfy]
+DisplayName = "Asset Downloader"
+Includes = []
